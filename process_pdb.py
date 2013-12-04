@@ -2,6 +2,45 @@
 # :noTabs=true:
 
 """
+create a directory of the contents in a PDB
+splits into chains, grouped chains (pairings parsed from the header),
+individual HETATM PDB lines, sequence files (FASTA), etc.
+
+verbosely:
+    This method behaves slightly differently for PDB files with multiple models,
+    nucleic acids, duplicate complexes, etc.
+    so if you are interested in the specifics, please read the source code
+    
+    In short, it tries to write:
+        header.txt          a text file of the header lines
+        numbering_map.txt   a text file showing 1-indexed PDB numbering
+        clean.pdb           only ATOM lines
+        hetatm.pdb          only HETATM lines, may be split by resName
+        .fa                 sequences of all peptides and nucleic acids
+        subdirectories      for each protein model/subunit (similar info)
+    
+    does not write a text file for the "trailer" (lines after the coordinates)
+    
+    converts lines (ATOM or HETATM) that can be converted based on  <conversion>
+    (generally) and  <na_conversion>  (specific for nucleic acids, relevant
+    because RNA and DNA may require different treatment...)
+    !!!WARNING!!! defaults:
+        CSE     CYS     converts SelenoCysteinE to Cysteine
+        HYP     PRO     converts HYdroxylProline to Proline
+        CYD     CYS     does NOT convert "CYsteine Disulfides to Cysteine"
+        HIP     HIS     converts "HIP" to Histidine (~double protonation)
+        HID     HIS     converts "HID" to Histidine (~single delta N proton)
+        HIE     HIS     converts "HIE" to Histidine (~single epsilon N proton)
+
+    todo:
+        ensure hetatm conversions step, illegal atoms!!!!
+        alternate conformations (mostly supported now)
+        convert DNA to Rosetta DNA
+        convert ligands to params
+        convert water to TP3 (or TP5)
+
+
+
 Methods for cleaning and parsing PDB files
 
 Most importantly, the process_pdb method does a lot to clean PDB files
@@ -10,13 +49,6 @@ from RCSB
 Requires:
     
     Biopython
-
-Uses:
-
-    paths.py
-    settings.py
-    biopython_settings.py
-    seq_basics.py
     
 Author: Evan H. Baugh
 """
@@ -30,6 +62,10 @@ import os
 import shutil
 
 # bigger modules
+from Bio.Alphabet import IUPAC
+from Bio import SeqIO
+from Bio.Seq import Seq
+from Bio.SeqRecord import SeqRecord
 from Bio.PDB import PDBIO
 from Bio.PDB import PDBParser
 from Bio.PDB import PPBuilder    # no longer used, much faster way to do this
@@ -40,11 +76,1162 @@ from Bio.Seq import Seq
 from Bio.SeqRecord import SeqRecord
 
 # custom modules
-from helper import get_root_filename , create_directory , copy_file
-from settings import SEQFORMAT , SEQFORMAT_EXTENSION_MAP , NUCLEIC_SEQUENCE_LETTERS_MAP , NA_CODES , three2one , WATER_CONVERSION , one2three , three2three , NA_CONVERSIONS_ROSETTA
-from biopython_settings import DNAAlphabet , ProteinAlphabet
+#from helper import get_root_filename , create_directory , copy_file
+#from settings import SEQFORMAT , SEQFORMAT_EXTENSION_MAP , NUCLEIC_SEQUENCE_LETTERS_MAP , NA_CODES , three2one , WATER_CONVERSION , one2three , three2three , NA_CONVERSIONS_ROSETTA
+#from biopython_settings import DNAAlphabet , ProteinAlphabet
 
-from seq_basics import write_sequence , get_sequence
+#from seq_basics import write_sequence , get_sequence
+
+################################################################################
+# SETTINGS
+
+# unholy settings...too many...
+
+SEQFORMAT = 'fasta'
+SEQFORMAT_EXTENSION_MAP = {
+    'fasta' : 'fa' ,
+    'genbank' : 'gb' ,
+    'clustal' : 'aln' ,
+    'stockholm' : 'ann'
+    }
+
+# mapping for sequence file extensions
+# update when you start using something new
+SEQFORMAT_MAP = {
+    'fa' : 'fasta' ,
+    'fas' : 'fasta' ,
+    'fasta' : 'fasta' ,
+    'gbk' : 'genbank' ,
+    'gb' : 'genbank' ,
+    'aln' : 'clustal' ,
+    'ann' : 'stockholm' ,    # Pfam uses these
+    'pir' : 'pir' ,    # used by Modeller...
+    'sp' : 'swiss'    # uniprot/swissprot
+    }
+
+# Biopython Alphabets
+DNAAlphabet = IUPAC.unambiguous_dna    # requires Biopython
+ProteinAlphabet = IUPAC.protein    # requires Biopython
+
+# simple amino acid mapping
+one2three = {
+    'A':'ALA',
+    'C':'CYS',
+    'D':'ASP',
+    'E':'GLU',
+    'F':'PHE',
+    'G':'GLY',
+    'H':'HIS',
+    'I':'ILE',
+    'K':'LYS',
+    'L':'LEU',
+    'M':'MET',
+    'N':'ASN',
+    'P':'PRO',
+    'Q':'GLN',
+    'R':'ARG',
+    'S':'SER',
+    'T':'THR',
+    'V':'VAL',
+    'W':'TRP',
+    'Y':'TYR',
+    }
+
+# the revers of above...maybe more?
+three2one = {
+    'ALA':'A',
+    'CYS':'C',
+    'ASP':'D',
+    'GLU':'E',
+    'PHE':'F',
+    'GLY':'G',
+    'HIS':'H',
+    'ILE':'I',
+    'LYS':'K',
+    'LEU':'L',
+    'MET':'M',
+    'ASN':'N',
+    'PRO':'P',
+    'GLN':'Q',
+    'ARG':'R',
+    'SER':'S',
+    'THR':'T',
+    'VAL':'V',
+    'TRP':'W',
+    'TYR':'Y',
+    # pseudo-standard 3 letter codes for the standard aa
+    'CYD' : 'C' ,
+    'CYZ' : 'C' ,
+    'HID' : 'H' ,
+    'HIE' : 'H' ,
+    'HIP' : 'H' ,
+    # just to be sure...
+    'ala':'A',
+    'cys':'C',
+    'asp':'D',
+    'glu':'E',
+    'phe':'F',
+    'gly':'G',
+    'his':'H',
+    'ile':'I',
+    'lys':'K',
+    'leu':'L',
+    'met':'M',
+    'asn':'N',
+    'pro':'P',
+    'gln':'Q',
+    'arg':'R',
+    'ser':'S',
+    'thr':'T',
+    'val':'V',
+    'trp':'W',
+    'tyr':'Y',
+    'Ala':'A',
+    'Cys':'C',
+    'Asp':'D',
+    'Glu':'E',
+    'Phe':'F',
+    'Gly':'G',
+    'His':'H',
+    'Ile':'I',
+    'Lys':'K',
+    'Leu':'L',
+    'Met':'M',
+    'Asn':'N',
+    'Pro':'P',
+    'Gln':'Q',
+    'Arg':'R',
+    'Ser':'S',
+    'Thr':'T',
+    'Val':'V',
+    'Trp':'W',
+    'Tyr':'Y',
+    }
+
+###################
+# HETATM CONVERSION
+
+# unsure about these...may include ATOM or HETATM lines...
+
+#from http://astral.stanford.edu/scopseq-1.55/release-notes-1.55.txt
+three2three = {
+    'AIB' : 'ALA' ,    # HETEROATOM THAT MAY BE TREATED AS ALA
+    'ALA' : 'ALA' ,    # ALA
+    'ALM' : 'ALA' ,    # HETEROATOM THAT MAY BE TREATED AS ALA
+    'AYA' : 'ALA' ,    # HETEROATOM THAT MAY BE TREATED AS ALA
+    'BNN' : 'ALA' ,    # HETEROATOM THAT MAY BE TREATED AS ALA
+    'CHG' : 'ALA' ,    # HETEROATOM THAT MAY BE TREATED AS ALA
+    'CSD' : 'ALA' ,    # HETEROATOM THAT MAY BE TREATED AS ALA
+    'DAL' : 'ALA' ,    # HETEROATOM THAT MAY BE TREATED AS ALA
+    'DHA' : 'ALA' ,    # HETEROATOM THAT MAY BE TREATED AS ALA
+    'DNP' : 'ALA' ,    # HETEROATOM THAT MAY BE TREATED AS ALA
+    'FLA' : 'ALA' ,    # HETEROATOM THAT MAY BE TREATED AS ALA
+    'HAC' : 'ALA' ,    # HETEROATOM THAT MAY BE TREATED AS ALA
+    'PRR' : 'ALA' ,    # HETEROATOM THAT MAY BE TREATED AS ALA
+    'MAA' : 'ALA' ,    # HETEROATOM THAT MAY BE TREATED AS ALA
+    'TIH' : 'ALA' ,    # HETEROATOM THAT MAY BE TREATED AS ALA
+    'TPQ' : 'ALA' ,    # HETEROATOM THAT MAY BE TREATED AS ALA
+    '0CS':'ALA',                    ##  0CS ALA  3-[(S)-HYDROPEROXYSULFINYL]-L-ALANINE
+    '2BU':'ALA',                    ##  2BU ADE
+    '2OP':'ALA',                    ##  2OP (2S  2-HYDROXYPROPANAL
+    '4F3':'ALA',                    ##  4F3 ALA  CYCLIZED
+    'AA4':'ALA',                    ##  AA4 ALA  2-AMINO-5-HYDROXYPENTANOIC ACID
+    'ABA':'ALA',                    ##  ABA ALA  ALPHA-AMINOBUTYRIC ACID
+    'AHO':'ALA',                    ##  AHO ALA  N-ACETYL-N-HYDROXY-L-ORNITHINE
+    'AHP':'ALA',                    ##  AHP ALA  2-AMINO-HEPTANOIC ACID
+    'AIB':'ALA',                    ##  AIB ALA  ALPHA-AMINOISOBUTYRIC ACID
+    'ALA':'ALA',                    ##  ALA ALA
+    'ALC':'ALA',                    ##  ALC ALA  2-AMINO-3-CYCLOHEXYL-PROPIONIC ACID
+    'ALM':'ALA',                    ##  ALM ALA  1-METHYL-ALANINAL
+    'ALN':'ALA',                    ##  ALN ALA  NAPHTHALEN-2-YL-3-ALANINE
+    'ALS':'ALA',                    ##  ALS ALA  2-AMINO-3-OXO-4-SULFO-BUTYRIC ACID
+    'ALT':'ALA',                    ##  ALT ALA  THIOALANINE
+    'AP7':'ALA',                    ##  AP7 ADE
+    'APH':'ALA',                    ##  APH ALA  P-AMIDINOPHENYL-3-ALANINE
+    'AYA':'ALA',                    ##  AYA ALA  N-ACETYLALANINE
+    'AYG':'ALA',                    ##  AYG ALA
+    'B2A':'ALA',                    ##  B2A ALA  ALANINE BORONIC ACID
+    'B3A':'ALA',                    ##  B3A ALA  (3S)-3-AMINOBUTANOIC ACID
+    'BAL':'ALA',                    ##  BAL ALA  BETA-ALANINE
+    'BNN':'ALA',                    ##  BNN ALA  ACETYL-P-AMIDINOPHENYLALANINE
+    'C12':'ALA',                    ##  C12 ALA
+    'C99':'ALA',                    ##  C99 ALA
+    'CAB':'ALA',                    ##  CAB ALA  4-CARBOXY-4-AMINOBUTANAL
+    'CH6':'ALA',                    ##  CH6 ALA
+    'CH7':'ALA',                    ##  CH7 ALA
+    'CLB':'ALA',                    ##  CLB ALA
+    'CLD':'ALA',                    ##  CLD ALA
+    'CLV':'ALA',                    ##  CLV ALA
+    'CQR':'ALA',                    ##  CQR ALA
+    'CR2':'ALA',                    ##  CR2 ALA  POST-TRANSLATIONAL MODIFICATION
+    'CR5':'ALA',                    ##  CR5 ALA
+    'CR7':'ALA',                    ##  CR7 ALA
+    'CR8':'ALA',                    ##  CR8 ALA
+    'CRK':'ALA',                    ##  CRK ALA
+    'CRW':'ALA',                    ##  CRW ALA
+    'CRX':'ALA',                    ##  CRX ALA
+    'CSI':'ALA',                    ##  CSI ALA
+    'CSY':'ALA',                    ##  CSY ALA  MODIFIED TYROSINE COMPLEX
+    'CWR':'ALA',                    ##  CWR ALA
+    'DAB':'ALA',                    ##  DAB ALA  2,4-DIAMINOBUTYRIC ACID
+    'DAL':'ALA',                    ##  DAL ALA  D-ALANINE
+    'DAM':'ALA',                    ##  DAM ALA  N-METHYL-ALPHA-BETA-DEHYDROALANINE
+    'DBU':'ALA',                    ##  DBU ALA  (2E)-2-AMINOBUT-2-ENOIC ACID
+    'DBZ':'ALA',                    ##  DBZ ALA  3-(BENZOYLAMINO)-L-ALANINE
+    'DHA':'ALA',                    ##  DHA ALA  2-AMINO-ACRYLIC ACID
+    'DPP':'ALA',                    ##  DPP ALA  DIAMMINOPROPANOIC ACID
+'FGL':'ALA',                    ##  FGL ALA  2-AMINOPROPANEDIOIC ACID
+'DYG':'ALA',                    ##  DYG ALA
+'GMU':'ALA',                    ##  GMU 5MU
+'HHK':'ALA',                    ##  HHK ALA  (2S)-2,8-DIAMINOOCTANOIC ACID
+'HMF':'ALA',                    ##  HMF ALA  2-AMINO-4-PHENYL-BUTYRIC ACID
+'IAM':'ALA',                    ##  IAM ALA  4-[(ISOPROPYLAMINO)METHYL]PHENYLALANINE
+'IGL':'ALA',                    ##  IGL ALA  ALPHA-AMINO-2-INDANACETIC ACID
+'KYN':'ALA',                    ##  KYN ALA  KYNURENINE
+'LAL':'ALA',                    ##  LAL ALA  N,N-DIMETHYL-L-ALANINE
+'MAA':'ALA',                    ##  MAA ALA  N-METHYLALANINE
+'MDO':'ALA',                    ##  MDO ALA
+'MFC':'ALA',                    ##  MFC ALA  CYCLIZED
+'NAL':'ALA',                    ##  NAL ALA  BETA-(2-NAPHTHYL)-ALANINE
+'NAM':'ALA',                    ##  NAM ALA  NAM NAPTHYLAMINOALANINE
+'NCB':'ALA',                    ##  NCB ALA  CHEMICAL MODIFICATION
+'NRQ':'ALA',                    ##  NRQ ALA
+'NYC':'ALA',                    ##  NYC ALA
+'ORN':'ALA',                    ##  ORN ALA  ORNITHINE
+'PIA':'ALA',                    ##  PIA ALA  FUSION OF ALA 65, TYR 66, GLY 67
+'PRR':'ALA',                    ##  PRR ALA  3-(METHYL-PYRIDINIUM)ALANINE
+'PYA':'ALA',                    ##  PYA ALA  3-(1,10-PHENANTHROL-2-YL)-L-ALANINE
+'PYC':'ALA',                    ##  PYC ALA  PYRROLE-2-CARBOXYLATE
+'PYT':'ALA',                    ##  PYT ALA  MODIFIED ALANINE
+'RC7':'ALA',                    ##  RC7 ALA
+'SEC':'ALA',                    ##  SEC ALA  2-AMINO-3-SELENINO-PROPIONIC ACID
+'SIC':'ALA',                    ##  SIC ALA
+'SUI':'ALA',                    ##  SUI ALA
+'TIH':'ALA',                    ##  TIH ALA  BETA(2-THIENYL)ALANINE
+'TPQ':'ALA',                    ##  TPQ ALA  2,4,5-TRIHYDROXYPHENYLALANINE
+'UMA':'ALA',                    ##  UMA ALA
+'X9Q':'ALA',                    ##  X9Q ALA
+'XXY':'ALA',                    ##  XXY ALA
+'XYG':'ALA',                    ##  XYG ALA
+
+#    'ASX' : 'B' ,    # why is this here!?
+
+    'BCS' : 'CYS' ,    # HETEROATOM THAT MAY BE TREATED AS CYS
+    'BUC' : 'CYS' ,    # HETEROATOM THAT MAY BE TREATED AS CYS
+    'C5C' : 'CYS' ,    # HETEROATOM THAT MAY BE TREATED AS CYS
+    'C6C' : 'CYS' ,    # HETEROATOM THAT MAY BE TREATED AS CYS
+    'CCS' : 'CYS' ,    # HETEROATOM THAT MAY BE TREATED AS CYS
+    'CEA' : 'CYS' ,    # HETEROATOM THAT MAY BE TREATED AS CYS
+    'CME' : 'CYS' ,    # HETEROATOM THAT MAY BE TREATED AS CYS
+    'CSO' : 'CYS' ,    # HETEROATOM THAT MAY BE TREATED AS CYS
+    'CSP' : 'CYS' ,    # HETEROATOM THAT MAY BE TREATED AS CYS
+    'CSS' : 'CYS' ,    # HETEROATOM THAT MAY BE TREATED AS CYS
+    'CSX' : 'CYS' ,    # HETEROATOM THAT MAY BE TREATED AS CYS
+    'CSW' : 'CYS' ,    # HETEROATOM THAT MAY BE TREATED AS CYS
+    'CY1' : 'CYS' ,    # HETEROATOM THAT MAY BE TREATED AS CYS
+    'CY3' : 'CYS' ,    # HETEROATOM THAT MAY BE TREATED AS CYS
+    'CYG' : 'CYS' ,    # HETEROATOM THAT MAY BE TREATED AS CYS
+    'CYM' : 'CYS' ,    # HETEROATOM THAT MAY BE TREATED AS CYS
+    'CYS' : 'CYS' ,    # CYS
+    'CYQ' : 'CYS' ,    # HETEROATOM THAT MAY BE TREATED AS CYS
+    'DCY' : 'CYS' ,    # HETEROATOM THAT MAY BE TREATED AS CYS
+    'EFC' : 'CYS' ,    # HETEROATOM THAT MAY BE TREATED AS CYS
+    'OCS' : 'CYS' ,    # HETEROATOM THAT MAY BE TREATED AS CYS
+    'PEC' : 'CYS' ,    # HETEROATOM THAT MAY BE TREATED AS CYS
+    'PR3' : 'CYS' ,    # HETEROATOM THAT MAY BE TREATED AS CYS
+    'SCH' : 'CYS' ,    # HETEROATOM THAT MAY BE TREATED AS CYS
+    'SCS' : 'CYS' ,    # HETEROATOM THAT MAY BE TREATED AS CYS
+    'SCY' : 'CYS' ,    # HETEROATOM THAT MAY BE TREATED AS CYS
+    'SHC' : 'CYS' ,    # HETEROATOM THAT MAY BE TREATED AS CYS
+    'SMC' : 'CYS' ,    # HETEROATOM THAT MAY BE TREATED AS CYS
+    'SOC' : 'CYS' ,    # HETEROATOM THAT MAY BE TREATED AS CYS
+'5CS':'CYS',                    ##  5CS CYS
+'AGT':'CYS',                    ##  AGT CYS  AGMATINE-CYSTEINE ADDUCT
+'BBC':'CYS',                    ##  BBC CYS
+'BCS':'CYS',                    ##  BCS CYS  BENZYLCYSTEINE
+'BCX':'CYS',                    ##  BCX CYS  BETA-3-CYSTEINE
+'BPE':'CYS',                    ##  BPE CYS
+'BUC':'CYS',                    ##  BUC CYS  S,S-BUTYLTHIOCYSTEINE
+'C3Y':'CYS',                    ##  C3Y CYS  MODIFIED CYSTEINE
+'C5C':'CYS',                    ##  C5C CYS  S-CYCLOPENTYL THIOCYSTEINE
+'C6C':'CYS',                    ##  C6C CYS  S-CYCLOHEXYL THIOCYSTEINE
+'CAF':'CYS',                    ##  CAF CYS  S-DIMETHYLARSINOYL-CYSTEINE
+'CAS':'CYS',                    ##  CAS CYS  S-(DIMETHYLARSENIC)CYSTEINE
+'CCS':'CYS',                    ##  CCS CYS  CARBOXYMETHYLATED CYSTEINE
+'CME':'CYS',                    ##  CME CYS  MODIFIED CYSTEINE
+'CML':'CYS',                    ##  CML CYS
+'CMT':'CYS',                    ##  CMT CYS  O-METHYLCYSTEINE
+'CS1':'CYS',                    ##  CS1 CYS  S-(2-ANILINYL-SULFANYL)-CYSTEINE
+'CS3':'CYS',                    ##  CS3 CYS
+'CS4':'CYS',                    ##  CS4 CYS
+'CSA':'CYS',                    ##  CSA CYS  S-ACETONYLCYSTEIN
+'CSB':'CYS',                    ##  CSB CYS  CYS BOUND TO LEAD ION
+'CSD':'CYS',                    ##  CSD CYS  3-SULFINOALANINE
+'CSE':'CYS',                    ##  CSE CYS  SELENOCYSTEINE
+'CSO':'CYS',                    ##  CSO CYS  INE S-HYDROXYCYSTEINE
+'CSR':'CYS',                    ##  CSR CYS  S-ARSONOCYSTEINE
+'CSS':'CYS',                    ##  CSS CYS  1,3-THIAZOLE-4-CARBOXYLIC ACID
+'CSU':'CYS',                    ##  CSU CYS  CYSTEINE-S-SULFONIC ACID
+'CSW':'CYS',                    ##  CSW CYS  CYSTEINE-S-DIOXIDE
+'CSX':'CYS',                    ##  CSX CYS  OXOCYSTEINE
+'CSZ':'CYS',                    ##  CSZ CYS  S-SELANYL CYSTEINE
+'CY0':'CYS',                    ##  CY0 CYS  MODIFIED CYSTEINE
+'CY1':'CYS',                    ##  CY1 CYS  ACETAMIDOMETHYLCYSTEINE
+'CY3':'CYS',                    ##  CY3 CYS  2-AMINO-3-MERCAPTO-PROPIONAMIDE
+'CY4':'CYS',                    ##  CY4 CYS  S-BUTYRYL-CYSTEIN
+'CY7':'CYS',                    ##  CY7 CYS  MODIFIED CYSTEINE
+#'CYD':'CYS',                    ##  CYD CYS
+'CYF':'CYS',                    ##  CYF CYS  FLUORESCEIN LABELLED CYS380 (P14)
+'CYG':'CYS',                    ##  CYG CYS
+'CYQ':'CYS',                    ##  CYQ CYS
+'CYR':'CYS',                    ##  CYR CYS
+'CYS':'CYS',                    ##  CYS CYS
+'CZ2':'CYS',                    ##  CZ2 CYS  S-(DIHYDROXYARSINO)CYSTEINE
+'CZZ':'CYS',                    ##  CZZ CYS  THIARSAHYDROXY-CYSTEINE
+'DCY':'CYS',                    ##  DCY CYS  D-CYSTEINE
+'DYS':'CYS',                    ##  DYS CYS
+'EFC':'CYS',                    ##  EFC CYS  S,S-(2-FLUOROETHYL)THIOCYSTEINE
+'FOE':'CYS',                    ##  FOE CYS
+'GT9':'CYS',                    ##  GT9 CYS  SG ALKYLATED
+'GYC':'CYS',                    ##  GYC CYS
+'HTI':'CYS',                    ##  HTI CYS
+'KOR':'CYS',                    ##  KOR CYS  MODIFIED CYSTEINE
+'M0H':'CYS',                    ##  M0H CYS  S-(HYDROXYMETHYL)-L-CYSTEINE
+'MCS':'CYS',                    ##  MCS CYS  MALONYLCYSTEINE
+'NPH':'CYS',                    ##  NPH CYS
+'NYS':'CYS',                    ##  NYS CYS
+'OCS':'CYS',                    ##  OCS CYS  CYSTEINE SULFONIC ACID
+'OCY':'CYS',                    ##  OCY CYS  HYDROXYETHYLCYSTEINE
+'P1L':'CYS',                    ##  P1L CYS  S-PALMITOYL CYSTEINE
+'PBB':'CYS',                    ##  PBB CYS  S-(4-BROMOBENZYL)CYSTEINE
+'PEC':'CYS',                    ##  PEC CYS  S,S-PENTYLTHIOCYSTEINE
+'PR3':'CYS',                    ##  PR3 CYS  INE DTT-CYSTEINE
+'PYX':'CYS',                    ##  PYX CYS  S-[S-THIOPYRIDOXAMINYL]CYSTEINE
+'R1A':'CYS',                    ##  R1A CYS
+'R1B':'CYS',                    ##  R1B CYS
+'R1F':'CYS',                    ##  R1F CYS
+'R7A':'CYS',                    ##  R7A CYS
+'RCY':'CYS',                    ##  RCY CYS
+'SAH':'CYS',                    ##  SAH CYS  S-ADENOSYL-L-HOMOCYSTEINE
+'SC2':'CYS',                    ##  SC2 CYS  N-ACETYL-L-CYSTEINE
+'SCH':'CYS',                    ##  SCH CYS  S-METHYL THIOCYSTEINE GROUP
+'SCS':'CYS',                    ##  SCS CYS  MODIFIED CYSTEINE
+'SCY':'CYS',                    ##  SCY CYS  CETYLATED CYSTEINE
+'SHC':'CYS',                    ##  SHC CYS  S-HEXYLCYSTEINE
+'SMC':'CYS',                    ##  SMC CYS  POST-TRANSLATIONAL MODIFICATION
+'SNC':'CYS',                    ##  SNC CYS  S-NITROSO CYSTEINE
+'SOC':'CYS',                    ##  SOC CYS  DIOXYSELENOCYSTEINE
+'TEE':'CYS',                    ##  TEE CYS  POST-TRANSLATIONAL MODIFICATION
+'TNB':'CYS',                    ##  TNB CYS  S-(2,3,6-TRINITROPHENYL)CYSTEINE
+'TYX':'CYS',                    ##  TYX CYS  S-(2-ANILINO-2-OXOETHYL)-L-CYSTEINE
+'YCM':'CYS',                    ##  YCM CYS  S-(2-AMINO-2-OXOETHYL)-L-CYSTEINE
+
+    '2AS' : 'ASP' ,    # HETEROATOM THAT MAY BE TREATED AS ASP
+    'ASA' : 'ASP' ,    # HETEROATOM THAT MAY BE TREATED AS ASP
+    'ASB' : 'ASP' ,    # HETEROATOM THAT MAY BE TREATED AS ASP
+    'ASK' : 'ASP' ,    # HETEROATOM THAT MAY BE TREATED AS ASP
+    'ASL' : 'ASP' ,    # HETEROATOM THAT MAY BE TREATED AS ASP
+    'ASP' : 'ASP' ,    # ASP
+    'ASQ' : 'ASP' ,    # HETEROATOM THAT MAY BE TREATED AS ASP
+    'BHD' : 'ASP' ,    # HETEROATOM THAT MAY BE TREATED AS ASP
+    'DAS' : 'ASP' ,    # HETEROATOM THAT MAY BE TREATED AS ASP
+    'DSP' : 'ASP' ,    # HETEROATOM THAT MAY BE TREATED AS ASP
+'3MD':'ASP',                    ##  3MD ASP  2S,3S-3-METHYLASPARTIC ACID
+'A0A':'ASP',                    ##  A0A ASP  ASPARTYL-FORMYL MIXED ANHYDRIDE
+'ACB':'ASP',                    ##  ACB ASP  3-METHYL-ASPARTIC ACID
+'AKL':'ASP',                    ##  AKL ASP  3-AMINO-5-CHLORO-4-OXOPENTANOIC ACID
+'ASA':'ASP',                    ##  ASA ASP  ASPARTIC ALDEHYDE
+'ASB':'ASP',                    ##  ASB ASP  ASPARTIC ACID-4-CARBOXYETHYL ESTER
+'ASI':'ASP',                    ##  ASI ASP  L-ISO-ASPARTATE
+'ASK':'ASP',                    ##  ASK ASP  DEHYDROXYMETHYLASPARTIC ACID
+'ASL':'ASP',                    ##  ASL ASP  ASPARTIC ACID-4-CARBOXYETHYL ESTER
+'ASP':'ASP',                    ##  ASP ASP
+'B3D':'ASP',                    ##  B3D ASP  3-AMINOPENTANEDIOIC ACID
+'BFD':'ASP',                    ##  BFD ASP  ASPARTATE BERYLLIUM FLUORIDE
+'BHD':'ASP',                    ##  BHD ASP  BETA-HYDROXYASPARTIC ACID
+'DAS':'ASP',                    ##  DAS ASP  D-ASPARTIC ACID
+'DMK':'ASP',                    ##  DMK ASP  DIMETHYL ASPARTIC ACID
+'IAS':'ASP',                    ##  IAS ASP  ASPARTYL GROUP
+'OHS':'ASP',                    ##  OHS ASP  O-(CARBOXYSULFANYL)-4-OXO-L-HOMOSERINE
+'OXX':'ASP',                    ##  OXX ASP  OXALYL-ASPARTYL ANHYDRIDE
+'PHD':'ASP',                    ##  PHD ASP  2-AMINO-4-OXO-4-PHOSPHONOOXY-BUTYRIC ACID
+'SNN':'ASP',                    ##  SNN ASP  POST-TRANSLATIONAL MODIFICATION
+
+    '5HP' : 'GLU' ,    # HETEROATOM THAT MAY BE TREATED AS GLU
+    'CGU' : 'GLU' ,    # HETEROATOM THAT MAY BE TREATED AS GLU
+    'DGL' : 'GLU' ,    # HETEROATOM THAT MAY BE TREATED AS GLU
+    'GGL' : 'GLU' ,    # HETEROATOM THAT MAY BE TREATED AS GLU
+    'GLU' : 'GLU' ,    # GLU
+    'GMA' : 'GLU' ,    # HETEROATOM THAT MAY BE TREATED AS GLU
+    'PCA' : 'GLU' ,    # HETEROATOM THAT MAY BE TREATED AS GLU
+'AB7':'GLU',                    ##  AB7 GLU  ALPHA-AMINOBUTYRIC ACID
+'AR4':'GLU',                    ##  AR4 GLU
+'B3E':'GLU',                    ##  B3E GLU  (3S)-3-AMINOHEXANEDIOIC ACID
+'CGU':'GLU',                    ##  CGU GLU  CARBOXYLATION OF THE CG ATOM
+'DGL':'GLU',                    ##  DGL GLU  D-GLU
+'GLU':'GLU',                    ##  GLU GLU
+'GMA':'GLU',                    ##  GMA GLU  1-AMIDO-GLUTAMIC ACID
+'ILG':'GLU',                    ##  ILG GLU  GLU LINKED TO NEXT RESIDUE VIA CG
+'LME':'GLU',                    ##  LME GLU  (3R)-3-METHYL-L-GLUTAMIC ACID
+'MEG':'GLU',                    ##  MEG GLU  (2S,3R)-3-METHYL-GLUTAMIC ACID
+
+    'DAH' : 'PHE' ,    # HETEROATOM THAT MAY BE TREATED AS PHE
+    'DPN' : 'PHE' ,    # HETEROATOM THAT MAY BE TREATED AS PHE
+    'HPQ' : 'PHE' ,    # HETEROATOM THAT MAY BE TREATED AS PHE
+    'PHE' : 'PHE' ,    # PHE
+    'PHI' : 'PHE' ,    # HETEROATOM THAT MAY BE TREATED AS PHE
+    'PHL' : 'PHE' ,    # HETEROATOM THAT MAY BE TREATED AS PHE
+'1PA':'PHE',                    ##  1PA PHE  PHENYLMETHYLACETIC ACID ALANINE
+'23F':'PHE',                    ##  23F PHE  (2Z)-2-AMINO-3-PHENYLACRYLIC ACID
+'4PH':'PHE',                    ##  4PH PHE  4-METHYL-L-PHENYLALANINE
+'B2F':'PHE',                    ##  B2F PHE  PHENYLALANINE BORONIC ACID
+'BIF':'PHE',                    ##  BIF PHE
+'CHS':'PHE',                    ##  CHS PHE  4-AMINO-5-CYCLOHEXYL-3-HYDROXY-PENTANOIC AC
+'DAH':'PHE',                    ##  DAH PHE  3,4-DIHYDROXYDAHNYLALANINE
+'DPH':'PHE',                    ##  DPH PHE  DEAMINO-METHYL-PHENYLALANINE
+'DPN':'PHE',                    ##  DPN PHE  D-CONFIGURATION
+'FCL':'PHE',                    ##  FCL PHE  3-CHLORO-L-PHENYLALANINE
+'FOG':'PHE',                    ##  FOG PHE  PHENYLALANINOYL-[1-HYDROXY]-2-PROPYLENE
+'FRF':'PHE',                    ##  FRF PHE  PHE FOLLOWED BY REDUCED PHE
+'HPE':'PHE',                    ##  HPE PHE  HOMOPHENYLALANINE
+'HPH':'PHE',                    ##  HPH PHE  PHENYLALANINOL GROUP
+'HPQ':'PHE',                    ##  HPQ PHE  HOMOPHENYLALANINYLMETHANE
+'MEA':'PHE',                    ##  MEA PHE  N-METHYLPHENYLALANINE
+'MTY':'PHE',                    ##  MTY PHE  3-HYDROXYPHENYLALANINE
+'NFA':'PHE',                    ##  NFA PHE  MODIFIED PHENYLALANINE
+'PBF':'PHE',                    ##  PBF PHE  PARA-(BENZOYL)-PHENYLALANINE
+'PCS':'PHE',                    ##  PCS PHE  PHENYLALANYLMETHYLCHLORIDE
+'PF5':'PHE',                    ##  PF5 PHE  2,3,4,5,6-PENTAFLUORO-L-PHENYLALANINE
+'PFF':'PHE',                    ##  PFF PHE  4-FLUORO-L-PHENYLALANINE
+'PHA':'PHE',                    ##  PHA PHE  PHENYLALANINAL
+'PHE':'PHE',                    ##  PHE PHE
+'PHI':'PHE',                    ##  PHI PHE  IODO-PHENYLALANINE
+'PHL':'PHE',                    ##  PHL PHE  L-PHENYLALANINOL
+'PHM':'PHE',                    ##  PHM PHE  PHENYLALANYLMETHANE
+'PM3':'PHE',                    ##  PM3 PHE
+'PPN':'PHE',                    ##  PPN PHE  THE LIGAND IS A PARA-NITRO-PHENYLALANINE
+'PRQ':'PHE',                    ##  PRQ PHE  PHENYLALANINE
+'PSA':'PHE',                    ##  PSA PHE
+'SMF':'PHE',                    ##  SMF PHE  4-SULFOMETHYL-L-PHENYLALANINE
+
+    'GL3' : 'GLY' ,    # HETEROATOM THAT MAY BE TREATED AS GLY
+    'GLY' : 'GLY' ,    # GLY
+    'GLZ' : 'GLY' ,    # HETEROATOM THAT MAY BE TREATED AS GLY
+    'GSC' : 'GLY' ,    # HETEROATOM THAT MAY BE TREATED AS GLY
+    'MPQ' : 'GLY' ,    # HETEROATOM THAT MAY BE TREATED AS GLY
+    'MSA' : 'GLY' ,    # HETEROATOM THAT MAY BE TREATED AS GLY
+    'NMC' : 'GLY' ,    # HETEROATOM THAT MAY BE TREATED AS GLY
+    'SAR' : 'GLY' ,    # HETEROATOM THAT MAY BE TREATED AS GLY
+'ACY':'GLY',                    ##  ACY GLY  POST-TRANSLATIONAL MODIFICATION
+'CHG':'GLY',                    ##  CHG GLY  CYCLOHEXYL GLYCINE
+'CHP':'GLY',                    ##  CHP GLY  3-CHLORO-4-HYDROXYPHENYLGLYCINE
+'GHP':'GLY',                    ##  GHP GLY  4-HYDROXYPHENYLGLYCINE
+'GL3':'GLY',                    ##  GL3 GLY  POST-TRANSLATIONAL MODIFICATION
+'GLY':'GLY',                    ##  GLY GLY
+'GLZ':'GLY',                    ##  GLZ GLY  AMINO-ACETALDEHYDE
+'GYS':'GLY',                    ##  GYS GLY
+'IPG':'GLY',                    ##  IPG GLY  N-ISOPROPYL GLYCINE
+'MEU':'GLY',                    ##  MEU GLY  O-METHYL-GLYCINE
+'MPQ':'GLY',                    ##  MPQ GLY  N-METHYL-ALPHA-PHENYL-GLYCINE
+'MSA':'GLY',                    ##  MSA GLY  (2-S-METHYL) SARCOSINE
+'NMC':'GLY',                    ##  NMC GLY  N-CYCLOPROPYLMETHYL GLYCINE
+'PG9':'GLY',                    ##  PG9 GLY  D-PHENYLGLYCINE
+'SAR':'GLY',                    ##  SAR GLY  SARCOSINE
+'SHP':'GLY',                    ##  SHP GLY  (4-HYDROXYMALTOSEPHENYL)GLYCINE
+'TBG':'GLY',                    ##  TBG GLY  T-BUTYL GLYCINE
+
+    '3AH' : 'HIS' ,    # HETEROATOM THAT MAY BE TREATED AS HIS
+    'DHI' : 'HIS' ,    # HETEROATOM THAT MAY BE TREATED AS HIS
+    'HIC' : 'HIS' ,    # HETEROATOM THAT MAY BE TREATED AS HIS
+    'HIS' : 'HIS' ,    # HIS
+    'MHS' : 'HIS' ,    # HETEROATOM THAT MAY BE TREATED AS HIS
+    'NEM' : 'HIS' ,    # HETEROATOM THAT MAY BE TREATED AS HIS
+    'NEP' : 'HIS' ,    # HETEROATOM THAT MAY BE TREATED AS HIS
+    'HID' : 'HIS' ,    # single delta N protonation
+    'HIE' : 'HIS' ,    # single epsilon N protonation
+'3AH':'HIS',                    ##  3AH HIS
+'DDE':'HIS',                    ##  DDE HIS
+'DHI':'HIS',                    ##  DHI HIS  D-HISTIDINE
+'HIA':'HIS',                    ##  HIA HIS  L-HISTIDINE AMIDE
+'HIC':'HIS',                    ##  HIC HIS  4-METHYL-HISTIDINE
+'HIP':'HIS',                    ##  HIP HIS  ND1-PHOSPHONOHISTIDINE...or commonly used doubly protonated state
+'HIQ':'HIS',                    ##  HIQ HIS  MODIFIED HISTIDINE
+'HIS':'HIS',                    ##  HIS HIS
+'HSO':'HIS',                    ##  HSO HIS  HISTIDINOL
+'MHS':'HIS',                    ##  MHS HIS  1-N-METHYLHISTIDINE
+'NEP':'HIS',                    ##  NEP HIS  N1-PHOSPHONOHISTIDINE
+'NZH':'HIS',                    ##  NZH HIS
+'OHI':'HIS',                    ##  OHI HIS  3-(2-OXO-2H-IMIDAZOL-4-YL)-L-ALANINE
+'PSH':'HIS',                    ##  PSH HIS  1-THIOPHOSPHONO-L-HISTIDINE
+
+    'DIL' : 'ILE' ,    # HETEROATOM THAT MAY BE TREATED AS ILE
+    'IIL' : 'ILE' ,    # HETEROATOM THAT MAY BE TREATED AS ILE
+    'ILE' : 'ILE' ,    # ILE
+'B2I':'ILE',                    ##  B2I ILE  ISOLEUCINE BORONIC ACID
+'DIL':'ILE',                    ##  DIL ILE  D-ISOLEUCINE
+'IIL':'ILE',                    ##  IIL ILE  ISO-ISOLEUCINE
+'ILE':'ILE',                    ##  ILE ILE
+'ILX':'ILE',                    ##  ILX ILE  4,5-DIHYDROXYISOLEUCINE
+'IML':'ILE',                    ##  IML ILE  N-METHYLATED
+
+    'ALY' : 'LYS' ,    # HETEROATOM THAT MAY BE TREATED AS LYS
+    'DLY' : 'LYS' ,    # HETEROATOM THAT MAY BE TREATED AS LYS
+    'KCX' : 'LYS' ,    # HETEROATOM THAT MAY BE TREATED AS LYS
+    'LLP' : 'LYS' ,    # HETEROATOM THAT MAY BE TREATED AS LYS
+    'LLY' : 'LYS' ,    # HETEROATOM THAT MAY BE TREATED AS LYS
+    'LYM' : 'LYS' ,    # HETEROATOM THAT MAY BE TREATED AS LYS
+    'LYS' : 'LYS' ,    # LYS
+    'LYZ' : 'LYS' ,    # HETEROATOM THAT MAY BE TREATED AS LYS
+    'MLY' : 'LYS' ,    # HETEROATOM THAT MAY BE TREATED AS LYS
+    'SHR' : 'LYS' ,    # HETEROATOM THAT MAY BE TREATED AS LYS
+    'TRG' : 'LYS' ,    # HETEROATOM THAT MAY BE TREATED AS LYS
+'6CL':'LYS',                    ##  6CL LYS  6-CARBOXYLYSINE
+'ALY':'LYS',                    ##  ALY LYS  N(6)-ACETYLLYSINE
+'API':'LYS',                    ##  API LYS  2,6-DIAMINOPIMELIC ACID
+'APK':'LYS',                    ##  APK LYS
+'AZK':'LYS',                    ##  AZK LYS  (2S)-2-AMINO-6-TRIAZANYLHEXAN-1-OL
+'B3K':'LYS',                    ##  B3K LYS  (3S)-3,7-DIAMINOHEPTANOIC ACID
+'BLY':'LYS',                    ##  BLY LYS  LYSINE BORONIC ACID
+'C1X':'LYS',                    ##  C1X LYS  MODIFIED LYSINE
+'CLG':'LYS',                    ##  CLG LYS
+'CLH':'LYS',                    ##  CLH LYS
+'CYJ':'LYS',                    ##  CYJ LYS  MODIFIED LYSINE
+'DLS':'LYS',                    ##  DLS LYS  DI-ACETYL-LYSINE
+'DLY':'LYS',                    ##  DLY LYS  D-LYSINE
+'DNL':'LYS',                    ##  DNL LYS  6-AMINO-HEXANAL
+'FHL':'LYS',                    ##  FHL LYS  MODIFIED LYSINE
+'GPL':'LYS',                    ##  GPL LYS  LYSINE GUANOSINE-5'-MONOPHOSPHATE
+'IT1':'LYS',                    ##  IT1 LYS
+'KCX':'LYS',                    ##  KCX LYS  CARBAMOYLATED LYSINE
+'KGC':'LYS',                    ##  KGC LYS
+'KST':'LYS',                    ##  KST LYS  N~6~-(5-CARBOXY-3-THIENYL)-L-LYSINE
+'LA2':'LYS',                    ##  LA2 LYS
+'LCK':'LYS',                    ##  LCK LYS
+'LCX':'LYS',                    ##  LCX LYS  CARBAMYLATED LYSINE
+'LDH':'LYS',                    ##  LDH LYS  N~6~-ETHYL-L-LYSINE
+'LET':'LYS',                    ##  LET LYS  ODIFIED LYSINE
+'LLP':'LYS',                    ##  LLP LYS
+'LLY':'LYS',                    ##  LLY LYS  NZ-(DICARBOXYMETHYL)LYSINE
+'LSO':'LYS',                    ##  LSO LYS  MODIFIED LYSINE
+'LYM':'LYS',                    ##  LYM LYS  DEOXY-METHYL-LYSINE
+'LYN':'LYS',                    ##  LYN LYS  2,6-DIAMINO-HEXANOIC ACID AMIDE
+'LYP':'LYS',                    ##  LYP LYS  N~6~-METHYL-N~6~-PROPYL-L-LYSINE
+'LYR':'LYS',                    ##  LYR LYS  MODIFIED LYSINE
+'LYS':'LYS',                    ##  LYS LYS
+'LYX':'LYS',                    ##  LYX LYS  N''-(2-COENZYME A)-PROPANOYL-LYSINE
+'LYZ':'LYS',                    ##  LYZ LYS  5-HYDROXYLYSINE
+'M2L':'LYS',                    ##  M2L LYS
+'M3L':'LYS',                    ##  M3L LYS  N-TRIMETHYLLYSINE
+'MCL':'LYS',                    ##  MCL LYS  NZ-(1-CARBOXYETHYL)-LYSINE
+'MLY':'LYS',                    ##  MLY LYS  METHYLATED LYSINE
+'MLZ':'LYS',                    ##  MLZ LYS  N-METHYL-LYSINE
+'OBS':'LYS',                    ##  OBS LYS  MODIFIED LYSINE
+'SLZ':'LYS',                    ##  SLZ LYS  L-THIALYSINE
+'XX1':'LYS',                    ##  XX1 LYS  N~6~-7H-PURIN-6-YL-L-LYSINE
+
+    'BUG' : 'LEU' ,    # HETEROATOM THAT MAY BE TREATED AS LEU
+    'CLE' : 'LEU' ,    # HETEROATOM THAT MAY BE TREATED AS LEU
+    'DLE' : 'LEU' ,    # HETEROATOM THAT MAY BE TREATED AS LEU
+    'LEU' : 'LEU' ,    # LEU
+    'MLE' : 'LEU' ,    # HETEROATOM THAT MAY BE TREATED AS LEU
+    'NLE' : 'LEU' ,    # HETEROATOM THAT MAY BE TREATED AS LEU
+    'NLN' : 'LEU' ,    # HETEROATOM THAT MAY BE TREATED AS LEU
+    'NLP' : 'LEU' ,    # HETEROATOM THAT MAY BE TREATED AS LEU
+'1LU':'LEU',                    ##  1LU LEU  4-METHYL-PENTANOIC ACID-2-OXYL GROUP
+'2ML':'LEU',                    ##  2ML LEU  2-METHYLLEUCINE
+'BLE':'LEU',                    ##  BLE LEU  LEUCINE BORONIC ACID
+'BUG':'LEU',                    ##  BUG LEU  TERT-LEUCYL AMINE
+'CLE':'LEU',                    ##  CLE LEU  LEUCINE AMIDE
+'DCL':'LEU',                    ##  DCL LEU  2-AMINO-4-METHYL-PENTANYL GROUP
+'DLE':'LEU',                    ##  DLE LEU  D-LEUCINE
+'DNE':'LEU',                    ##  DNE LEU  D-NORLEUCINE
+'DNG':'LEU',                    ##  DNG LEU  N-FORMYL-D-NORLEUCINE
+'DNM':'LEU',                    ##  DNM LEU  D-N-METHYL NORLEUCINE
+'FLE':'LEU',                    ##  FLE LEU  FUROYL-LEUCINE
+'HLU':'LEU',                    ##  HLU LEU  BETA-HYDROXYLEUCINE
+'LED':'LEU',                    ##  LED LEU  POST-TRANSLATIONAL MODIFICATION
+'LEF':'LEU',                    ##  LEF LEU  2-5-FLUOROLEUCINE
+'LEU':'LEU',                    ##  LEU LEU
+'LNT':'LEU',                    ##  LNT LEU
+'MHL':'LEU',                    ##  MHL LEU  N-METHYLATED, HYDROXY
+'MLE':'LEU',                    ##  MLE LEU  N-METHYLATED
+'MLL':'LEU',                    ##  MLL LEU  METHYL L-LEUCINATE
+'MNL':'LEU',                    ##  MNL LEU  4,N-DIMETHYLNORLEUCINE
+'NLE':'LEU',                    ##  NLE LEU  NORLEUCINE
+'NLN':'LEU',                    ##  NLN LEU  NORLEUCINE AMIDE
+'NLO':'LEU',                    ##  NLO LEU  O-METHYL-L-NORLEUCINE
+'PLE':'LEU',                    ##  PLE LEU  LEUCINE PHOSPHINIC ACID
+'PPH':'LEU',                    ##  PPH LEU  PHENYLALANINE PHOSPHINIC ACID
+
+    'CXM' : 'MET' ,    # HETEROATOM THAT MAY BE TREATED AS MET
+    'FME' : 'MET' ,    # HETEROATOM THAT MAY BE TREATED AS MET
+    'MET' : 'MET' ,    # MET
+    'MSE' : 'MET' ,    # HETEROATOM THAT MAY BE TREATED AS MET
+    'OMT' : 'MET' ,    # HETEROATOM THAT MAY BE TREATED AS MET
+'AME':'MET',                    ##  AME MET  ACETYLATED METHIONINE
+'CXM':'MET',                    ##  CXM MET  N-CARBOXYMETHIONINE
+'ESC':'MET',                    ##  ESC MET  2-AMINO-4-ETHYL SULFANYL BUTYRIC ACID
+'FME':'MET',                    ##  FME MET  FORMYL-METHIONINE
+'FOR':'MET',                    ##  FOR MET
+'MET':'MET',                    ##  MET MET
+'MHO':'MET',                    ##  MHO MET  POST-TRANSLATIONAL MODIFICATION
+'MME':'MET',                    ##  MME MET  N-METHYL METHIONINE
+'MSE':'MET',                    ##  MSE MET  ELENOMETHIONINE
+'MSO':'MET',                    ##  MSO MET  METHIONINE SULFOXIDE
+'OMT':'MET',                    ##  OMT MET  METHIONINE SULFONE
+'SME':'MET',                    ##  SME MET  METHIONINE SULFOXIDE
+
+    'ASN' : 'ASN' ,    # ASN
+    'MEN' : 'ASN' ,    # HETEROATOM THAT MAY BE TREATED AS ASN
+'AFA':'ASN',                    ##  AFA ASN  N-[7-METHYL-OCT-2,4-DIENOYL]ASPARAGINE
+'AHB':'ASN',                    ##  AHB ASN  BETA-HYDROXYASPARAGINE
+'ASN':'ASN',                    ##  ASN ASN
+'B3X':'ASN',                    ##  B3X ASN  (3S)-3,5-DIAMINO-5-OXOPENTANOIC ACID
+'DMH':'ASN',                    ##  DMH ASN  N4,N4-DIMETHYL-ASPARAGINE
+'DSG':'ASN',                    ##  DSG ASN  D-ASPARAGINE
+'MEN':'ASN',                    ##  MEN ASN  GAMMA METHYL ASPARAGINE
+
+    'DPR' : 'PRO' ,    # HETEROATOM THAT MAY BE TREATED AS PRO
+    'PRO' : 'PRO' ,    # PRO
+'1AB':'PRO',                    ##  1AB PRO  1,4-DIDEOXY-1,4-IMINO-D-ARABINITOL
+'2MT':'PRO',                    ##  2MT PRO
+'4FB':'PRO',                    ##  4FB PRO  (4S)-4-FLUORO-L-PROLINE
+'DPL':'PRO',                    ##  DPL PRO  4-OXOPROLINE
+'DPR':'PRO',                    ##  DPR PRO  D-PROLINE
+'H5M':'PRO',                    ##  H5M PRO  TRANS-3-HYDROXY-5-METHYLPROLINE
+'HY3':'PRO',                    ##  HY3 PRO  3-HYDROXYPROLINE
+'HYP':'PRO',                    ##  HYP PRO  4-HYDROXYPROLINE
+'LPD':'PRO',                    ##  LPD PRO  L-PROLINAMIDE
+'P2Y':'PRO',                    ##  P2Y PRO  (2S)-PYRROLIDIN-2-YLMETHYLAMINE
+'PCA':'PRO',                    ##  PCA PRO  5-OXOPROLINE
+'POM':'PRO',                    ##  POM PRO  CIS-5-METHYL-4-OXOPROLINE
+'PRO':'PRO',                    ##  PRO PRO
+'PRS':'PRO',                    ##  PRS PRO  THIOPROLINE
+
+    'DGN' : 'GLN' ,    # HETEROATOM THAT MAY BE TREATED AS GLN
+    'GLN' : 'GLN' ,    # GLN
+'DGN':'GLN',                    ##  DGN GLN  D-GLUTAMINE
+'GHG':'GLN',                    ##  GHG GLN  GAMMA-HYDROXY-GLUTAMINE
+'GLH':'GLN',                    ##  GLH GLN
+'GLN':'GLN',                    ##  GLN GLN
+'MGN':'GLN',                    ##  MGN GLN  2-METHYL-GLUTAMINE
+
+    'ACL' : 'ARG' ,    # HETEROATOM THAT MAY BE TREATED AS ARG
+    'AGM' : 'ARG' ,    # HETEROATOM THAT MAY BE TREATED AS ARG
+    'ARG' : 'ARG' ,    # ARG
+    'ARM' : 'ARG' ,    # HETEROATOM THAT MAY BE TREATED AS ARG
+    'DAR' : 'ARG' ,    # HETEROATOM THAT MAY BE TREATED AS ARG
+    'HAR' : 'ARG' ,    # HETEROATOM THAT MAY BE TREATED AS ARG
+    'HMR' : 'ARG' ,    # HETEROATOM THAT MAY BE TREATED AS ARG
+'2MR':'ARG',                    ##  2MR ARG  N3, N4-DIMETHYLARGININE
+'AAR':'ARG',                    ##  AAR ARG  ARGININEAMIDE
+'ACL':'ARG',                    ##  ACL ARG  DEOXY-CHLOROMETHYL-ARGININE
+'AGM':'ARG',                    ##  AGM ARG  4-METHYL-ARGININE
+'ALG':'ARG',                    ##  ALG ARG  GUANIDINOBUTYRYL GROUP
+'AR2':'ARG',                    ##  AR2 ARG  ARGINYL-BENZOTHIAZOLE-6-CARBOXYLIC ACID
+'ARG':'ARG',                    ##  ARG ARG
+'ARM':'ARG',                    ##  ARM ARG  DEOXY-METHYL-ARGININE
+'ARO':'ARG',                    ##  ARO ARG  C-GAMMA-HYDROXY ARGININE
+'BOR':'ARG',                    ##  BOR ARG
+'CIR':'ARG',                    ##  CIR ARG  CITRULLINE
+'DA2':'ARG',                    ##  DA2 ARG  MODIFIED ARGININE
+'DAR':'ARG',                    ##  DAR ARG  D-ARGININE
+'HMR':'ARG',                    ##  HMR ARG  BETA-HOMOARGININE
+'HRG':'ARG',                    ##  HRG ARG  L-HOMOARGININE
+'MAI':'ARG',                    ##  MAI ARG  DEOXO-METHYLARGININE
+'MGG':'ARG',                    ##  MGG ARG  MODIFIED D-ARGININE
+'NMM':'ARG',                    ##  NMM ARG  MODIFIED ARGININE
+'OPR':'ARG',                    ##  OPR ARG  C-(3-OXOPROPYL)ARGININE
+'ORQ':'ARG',                    ##  ORQ ARG  N~5~-ACETYL-L-ORNITHINE
+'TYZ':'ARG',                    ##  TYZ ARG  PARA ACETAMIDO BENZOIC ACID
+
+    'DSN' : 'SER' ,    # HETEROATOM THAT MAY BE TREATED AS SER
+    'MIS' : 'SER' ,    # HETEROATOM THAT MAY BE TREATED AS SER
+    'OAS' : 'SER' ,    # HETEROATOM THAT MAY BE TREATED AS SER
+    'SAC' : 'SER' ,    # HETEROATOM THAT MAY BE TREATED AS SER
+    'SEL' : 'SER' ,    # HETEROATOM THAT MAY BE TREATED AS SER
+    'SEP' : 'SER' ,    # HETEROATOM THAT MAY BE TREATED AS SER
+    'SER' : 'SER' ,    # SER
+    'SET' : 'SER' ,    # HETEROATOM THAT MAY BE TREATED AS SER
+    'SVA' : 'SER' ,    # HETEROATOM THAT MAY BE TREATED AS SER
+'B3S':'SER',                    ##  B3S SER  (3R)-3-AMINO-4-HYDROXYBUTANOIC ACID
+'BG1':'SER',                    ##  BG1 SER
+'DHL':'SER',                    ##  DHL SER  POST-TRANSLATIONAL MODIFICATION
+'DSE':'SER',                    ##  DSE SER  D-SERINE N-METHYLATED
+'DSN':'SER',                    ##  DSN SER  D-SERINE
+'FGP':'SER',                    ##  FGP SER
+'GVL':'SER',                    ##  GVL SER  SERINE MODIFED WITH PHOSPHOPANTETHEINE
+'HSE':'SER',                    ##  HSE SER  L-HOMOSERINE
+'HSL':'SER',                    ##  HSL SER  HOMOSERINE LACTONE
+'MC1':'SER',                    ##  MC1 SER  METHICILLIN ACYL-SERINE
+'MIS':'SER',                    ##  MIS SER  MODIFIED SERINE
+'N10':'SER',                    ##  N10 SER  O-[(HEXYLAMINO)CARBONYL]-L-SERINE
+'NC1':'SER',                    ##  NC1 SER  NITROCEFIN ACYL-SERINE
+'OAS':'SER',                    ##  OAS SER  O-ACETYLSERINE
+'OSE':'SER',                    ##  OSE SER  O-SULFO-L-SERINE
+'PG1':'SER',                    ##  PG1 SER  BENZYLPENICILLOYL-ACYLATED SERINE
+'PYR':'SER',                    ##  PYR SER  CHEMICALLY MODIFIED
+'S1H':'SER',                    ##  S1H SER  1-HEXADECANOSULFONYL-O-L-SERINE
+'SAC':'SER',                    ##  SAC SER  N-ACETYL-SERINE
+'SBD':'SER',                    ##  SBD SER
+'SBG':'SER',                    ##  SBG SER  MODIFIED SERINE
+'SBL':'SER',                    ##  SBL SER
+'SDP':'SER',                    ##  SDP SER
+'SEB':'SER',                    ##  SEB SER  O-BENZYLSULFONYL-SERINE
+'SEL':'SER',                    ##  SEL SER  2-AMINO-1,3-PROPANEDIOL
+'SEP':'SER',                    ##  SEP SER  E PHOSPHOSERINE
+'SER':'SER',                    ##  SER SER
+'SET':'SER',                    ##  SET SER  AMINOSERINE
+'SGB':'SER',                    ##  SGB SER  MODIFIED SERINE
+'SGR':'SER',                    ##  SGR SER  MODIFIED SERINE
+'SOY':'SER',                    ##  SOY SER  OXACILLOYL-ACYLATED SERINE
+'SUN':'SER',                    ##  SUN SER  TABUN CONJUGATED SERINE
+'SVA':'SER',                    ##  SVA SER  SERINE VANADATE
+'SVV':'SER',                    ##  SVV SER  MODIFIED SERINE
+'SVX':'SER',                    ##  SVX SER  MODIFIED SERINE
+'SVY':'SER',                    ##  SVY SER  MODIFIED SERINE
+'SVZ':'SER',                    ##  SVZ SER  MODIFIED SERINE
+'SXE':'SER',                    ##  SXE SER  MODIFIED SERINE
+
+    'ALO' : 'THR' ,    # HETEROATOM THAT MAY BE TREATED AS THR
+    'BMT' : 'THR' ,    # HETEROATOM THAT MAY BE TREATED AS THR
+    'DTH' : 'THR' ,    # HETEROATOM THAT MAY BE TREATED AS THR
+    'THR' : 'THR' ,    # THR
+    'TPO' : 'THR' ,    # HETEROATOM THAT MAY BE TREATED AS THR
+'AEI':'THR',                    ##  AEI THR  ACYLATED THR
+'ALO':'THR',                    ##  ALO THR  ALLO-THREONINE
+'BMT':'THR',                    ##  BMT THR
+'CRO':'THR',                    ##  CRO THR  CYCLIZED
+'CTH':'THR',                    ##  CTH THR  4-CHLOROTHREONINE
+'DTH':'THR',                    ##  DTH THR  D-THREONINE
+'OLT':'THR',                    ##  OLT THR  O-METHYL-L-THREONINE
+'TBM':'THR',                    ##  TBM THR
+'TH5':'THR',                    ##  TH5 THR  O-ACETYL-L-THREONINE
+'THC':'THR',                    ##  THC THR  N-METHYLCARBONYLTHREONINE
+'THR':'THR',                    ##  THR THR
+'TMD':'THR',                    ##  TMD THR  N-METHYLATED, EPSILON C ALKYLATED
+'TPO':'THR',                    ##  TPO THR  HOSPHOTHREONINE
+
+    'DIV' : 'VAL' ,    # HETEROATOM THAT MAY BE TREATED AS VAL
+    'DVA' : 'VAL' ,    # HETEROATOM THAT MAY BE TREATED AS VAL
+    'MVA' : 'VAL' ,    # HETEROATOM THAT MAY BE TREATED AS VAL
+    'VAL' : 'VAL' ,    # VAL
+'B2V':'VAL',                    ##  B2V VAL  VALINE BORONIC ACID
+'DIV':'VAL',                    ##  DIV VAL  D-ISOVALINE
+'DVA':'VAL',                    ##  DVA VAL  D-VALINE
+'MNV':'VAL',                    ##  MNV VAL  N-METHYL-C-AMINO VALINE
+'MVA':'VAL',                    ##  MVA VAL  N-METHYLATED
+'NVA':'VAL',                    ##  NVA VAL  NORVALINE
+'VAD':'VAL',                    ##  VAD VAL  DEAMINOHYDROXYVALINE
+'VAF':'VAL',                    ##  VAF VAL  METHYLVALINE
+'VAL':'VAL',                    ##  VAL VAL
+'VDL':'VAL',                    ##  VDL VAL  (2R,3R)-2,3-DIAMINOBUTANOIC ACID
+'VLL':'VAL',                    ##  VLL VAL  (2S)-2,3-DIAMINOBUTANOIC ACID
+'VME':'VAL',                    ##  VME VAL  O- METHYLVALINE
+
+    'DTR' : 'TRP' ,    # HETEROATOM THAT MAY BE TREATED AS TRP
+    'HTR' : 'TRP' ,    # HETEROATOM THAT MAY BE TREATED AS TRP
+    'LTR' : 'TRP' ,    # HETEROATOM THAT MAY BE TREATED AS TRP
+    'TPL' : 'TRP' ,    # HETEROATOM THAT MAY BE TREATED AS TRP
+    'TRO' : 'TRP' ,    # HETEROATOM THAT MAY BE TREATED AS TRP
+    'TRP' : 'TRP' ,    # TRP
+'BTR':'TRP',                    ##  BTR TRP  6-BROMO-TRYPTOPHAN
+'1TQ':'TRP',                    ##  1TQ TRP  6-(FORMYLAMINO)-7-HYDROXY-L-TRYPTOPHAN
+'23S':'TRP',                    ##  23S TRP  MODIFIED TRYPTOPHAN
+'32S':'TRP',                    ##  32S TRP  MODIFIED TRYPTOPHAN
+'32T':'TRP',                    ##  32T TRP  MODIFIED TRYPTOPHAN
+'4DP':'TRP',                    ##  4DP TRP
+'4FW':'TRP',                    ##  4FW TRP  4-FLUOROTRYPTOPHANE
+'4HT':'TRP',                    ##  4HT TRP  4-HYDROXYTRYPTOPHAN
+'4IN':'TRP',                    ##  4IN TRP  4-AMINO-L-TRYPTOPHAN
+'6CW':'TRP',                    ##  6CW TRP  6-CHLORO-L-TRYPTOPHAN
+'DTR':'TRP',                    ##  DTR TRP  D-TRYPTOPHAN
+'FTR':'TRP',                    ##  FTR TRP  FLUOROTRYPTOPHANE
+'HTR':'TRP',                    ##  HTR TRP  BETA-HYDROXYTRYPTOPHANE
+'PAT':'TRP',                    ##  PAT TRP  ALPHA-PHOSPHONO-TRYPTOPHAN
+'TOX':'TRP',                    ##  TOX TRP
+'TPL':'TRP',                    ##  TPL TRP  TRYTOPHANOL
+'TQQ':'TRP',                    ##  TQQ TRP
+'TRF':'TRP',                    ##  TRF TRP  N1-FORMYL-TRYPTOPHAN
+'TRN':'TRP',                    ##  TRN TRP  AZA-TRYPTOPHAN
+'TRO':'TRP',                    ##  TRO TRP  2-HYDROXY-TRYPTOPHAN
+'TRP':'TRP',                    ##  TRP TRP
+'TRQ':'TRP',                    ##  TRQ TRP
+'TRW':'TRP',                    ##  TRW TRP
+'TRX':'TRP',                    ##  TRX TRP  6-HYDROXYTRYPTOPHAN
+'TTQ':'TRP',                    ##  TTQ TRP  6-AMINO-7-HYDROXY-L-TRYPTOPHAN
+
+    'DTY' : 'TYR' ,    # HETEROATOM THAT MAY BE TREATED AS TYR
+    'IYR' : 'TYR' ,    # HETEROATOM THAT MAY BE TREATED AS TYR
+    'PAQ' : 'TYR' ,    # HETEROATOM THAT MAY BE TREATED AS TYR
+    'PTR' : 'TYR' ,    # HETEROATOM THAT MAY BE TREATED AS TYR
+    'STY' : 'TYR' ,    # HETEROATOM THAT MAY BE TREATED AS TYR
+    'TYB' : 'TYR' ,    # HETEROATOM THAT MAY BE TREATED AS TYR
+    'TYQ' : 'TYR' ,    # HETEROATOM THAT MAY BE TREATED AS TYR
+    'TYR' : 'TYR' ,    # HETEROATOM THAT MAY BE TREATED AS TYR
+    'TYS' : 'TYR' ,    # TYR
+    'TYY' : 'TYR' ,    # HETEROATOM THAT MAY BE TREATED AS TYR
+'1TY':'TYR',                    ##  1TY TYR
+'2TY':'TYR',                    ##  2TY TYR
+'3TY':'TYR',                    ##  3TY TYR  MODIFIED TYROSINE
+'B3Y':'TYR',                    ##  B3Y TYR
+'CRQ':'TYR',                    ##  CRQ TYR
+'DBY':'TYR',                    ##  DBY TYR  3,5 DIBROMOTYROSINE
+'DPQ':'TYR',                    ##  DPQ TYR  TYROSINE DERIVATIVE
+'DTY':'TYR',                    ##  DTY TYR  D-TYROSINE
+'ESB':'TYR',                    ##  ESB TYR
+'FLT':'TYR',                    ##  FLT TYR  FLUOROMALONYL TYROSINE
+'FTY':'TYR',                    ##  FTY TYR  DEOXY-DIFLUOROMETHELENE-PHOSPHOTYROSINE
+'IYR':'TYR',                    ##  IYR TYR  3-IODO-TYROSINE
+'MBQ':'TYR',                    ##  MBQ TYR
+'NIY':'TYR',                    ##  NIY TYR  META-NITRO-TYROSINE
+'NBQ':'TYR',                    ##  NBQ TYR
+'OTY':'TYR',                    ##  OTY TYR
+'PAQ':'TYR',                    ##  PAQ TYR  SEE REMARK 999
+'PTH':'TYR',                    ##  PTH TYR  METHYLENE-HYDROXY-PHOSPHOTYROSINE
+'PTM':'TYR',                    ##  PTM TYR  ALPHA-METHYL-O-PHOSPHOTYROSINE
+'PTR':'TYR',                    ##  PTR TYR  O-PHOSPHOTYROSINE
+'TCQ':'TYR',                    ##  TCQ TYR  MODIFIED TYROSINE
+'TTS':'TYR',                    ##  TTS TYR
+'TY2':'TYR',                    ##  TY2 TYR  3-AMINO-L-TYROSINE
+'TY3':'TYR',                    ##  TY3 TYR  3-HYDROXY-L-TYROSINE
+'TYB':'TYR',                    ##  TYB TYR  TYROSINAL
+'TYC':'TYR',                    ##  TYC TYR  L-TYROSINAMIDE
+'TYI':'TYR',                    ##  TYI TYR  3,5-DIIODOTYROSINE
+'TYN':'TYR',                    ##  TYN TYR  ADDUCT AT HYDROXY GROUP
+'TYO':'TYR',                    ##  TYO TYR
+'TYQ':'TYR',                    ##  TYQ TYR  AMINOQUINOL FORM OF TOPA QUINONONE
+'TYR':'TYR',                    ##  TYR TYR
+'TYS':'TYR',                    ##  TYS TYR  INE SULPHONATED TYROSINE
+'TYT':'TYR',                    ##  TYT TYR
+'TYY':'TYR',                    ##  TYY TYR  IMINOQUINONE FORM OF TOPA QUINONONE
+'YOF':'TYR',                    ##  YOF TYR  3-FLUOROTYROSINE
+
+#    'GLX' : 'Z'    # why is this here!?
+    }
+
+####################
+# NUCLEIC ACID STUFF
+
+# for sequences...
+NUCLEIC_SEQUENCE_LETTERS_MAP = {
+    'A' : 'A' ,
+    'G' : 'G' ,
+    'C' : 'C' ,
+    'T' : 'T' ,
+    'U' : 'U' ,
+    'a' : 'A' ,
+    'g' : 'G' ,
+    'c' : 'C' ,
+    't' : 'T' ,
+    'u' : 'U' ,
+    'DA' : 'A' ,
+    'DG' : 'G' ,
+    'DC' : 'C' ,
+    'DT' : 'T' ,
+    'dA' : 'A' ,
+    'dG' : 'G' ,
+    'dC' : 'C' ,
+    'dT' : 'T' ,
+    'ADE' : 'A' ,
+    'GUA' : 'G' ,
+    'CYT' : 'C' ,
+    'THY' : 'T' ,
+    'URA' : 'U' ,
+    'rA' : 'A' ,
+    'rG' : 'G',
+    'rC' : 'C' ,
+    'rU' : 'U' ,
+    # HETATM lines
+    '1MA' : 'A' ,
+    '1MG' : 'G' ,
+    '2MG' : 'G' ,
+    '7MG' : 'G' ,
+    'OMG' : 'G' ,
+    'YG' : 'G' ,
+    '5MC' : 'C' ,
+    'CB2' : 'C' ,
+    'CBR' : 'C' ,
+    'DC' : 'C' ,
+    'OMC' : 'C' ,
+    '5BU' : 'U' ,
+    '5MU' : 'U' ,
+    'H2U' : 'U' ,
+    'PSU' : 'U' ,
+    'URI' : 'U'
+    }
+
+#                line_edit = line_edit.replace( 'HO2\'', '2HO*' )
+#                line_edit = line_edit.replace( 'HO5\'', '5HO*' )
+#                line_edit = line_edit.replace( 'H5\'\'', '2H5*' )
+
+#                line_edit = line_edit.replace('\'','*')
+#                line_edit = line_edit.replace('OP1','O1P')
+#                line_edit = line_edit.replace('OP2','O2P')
+
+NA_CODES = {}
+NA_CONVERSIONS_ROSETTA = {}
+
+#####
+# DNA
+
+# codes whose presence indicates DNA definitively
+NA_CODES['DNA'] = {
+    'T' : 'T' ,
+    't' : 'T' ,
+    'DA' : 'A' ,
+    'DG' : 'G' ,
+    'DC' : 'C' ,
+    'DT' : 'T' ,
+    'dA' : 'A' ,
+    'dG' : 'G' ,
+    'dC' : 'C' ,
+    'dT' : 'T' ,
+    'THY' : 'T'
+    }
+
+# convert from sequence to the resName for PDB format
+NA_CONVERSIONS_ROSETTA['DNA'] = {
+    'A' : 'A' ,
+    'G' : 'G' ,
+    'C' : 'C' ,
+    'T' : 'T' ,
+    'ADE' : 'A' ,
+    'GUA' : 'G' ,
+    'CYT' : 'C' ,
+    'THY' : 'T' ,
+    '1MA' : 'A' ,
+    '1MG' : 'G' ,
+    '2MG' : 'G' ,
+    '7MG' : 'G' ,
+    'OMG' : 'G' ,
+    'YG' : 'G' ,
+    '5MC' : 'C' ,
+    'CB2' : 'C' ,
+    'CBR' : 'C' ,
+    'DC' : 'C' ,
+    'OMC' : 'C' ,
+    }
+    
+# water! hooray!
+WATER_CONVERSION = {
+    'W' : 'TP3' ,
+    'HOH' : 'TP3' ,
+    'H2O' : 'TP3' ,
+    'WAT' : 'TP3' ,
+    'TP3' : 'TP3' ,
+    'TP5' : 'TP3'
+    }
+
+# fun with water
+#WATER_CODE = 'TP3'    # for possible use in PyRosetta
+#WATER_CODES = ['W' , 'HOH' , 'H2O' , 'WAT' , 'TP3' , 'TP5']    # resNames
+
+################################################################################
+# METHODS
+
+get_file_extension = lambda in_filename: in_filename.split( '.' )[-1]
+get_file_extension.__doc__ = 'Returns the file extension of  <in_filename>\n\nin_filename.split( \'.\' )[-1]'
+
+# hacky version
+get_root_filename = lambda in_filename: in_filename[:-len( get_file_extension( in_filename ) ) - 1]
+get_root_filename.__doc__ = 'Returns the \"root filename\" of  <in_filename>  (pre file extension)\n\nin_filename[:len( in_filename.split( \'.\' )[-1] ) - 1]\na little hacky...'
+# better version
+#get_root_filename = lambda in_filename: ''.join( [i for i in in_filename.split( '.' )[:-1]] )
+
+# helper for creating a directory, checks and delets existing name
+def create_directory( dir_name , tagline = ' to sort the data' ):
+    """
+    Creates the directory  <dir_name>
+    
+    WARNING: this will delete the directory and its contents if it already
+    exists!
+    
+    Optionally output something special in  <tagline>
+    """
+    # check if it exists
+    print 'Creating a new directory ' + os.path.relpath( dir_name ) + tagline
+    if os.path.isdir( dir_name ):
+        print 'a directory named ' + os.path.relpath( dir_name ) + ' already exists, deleting it now...'
+        shutil.rmtree( dir_name )
+    os.mkdir( dir_name )
+
+# copy helper
+def copy_file( filename , destination , display = False ):
+    """
+    Copy  <filename>  to/into  <destination>
+    
+    just a cp wrapper...what?
+    """
+    if display:    # optional
+        if os.path.isdir( destination ):
+            print 'placing a copy of ' + os.path.relpath( filename ) + ' into the ' + os.path.relpath( destination ) + ' directory'
+        elif os.path.isfile( destination ):
+            print 'copying ' + os.path.relpath( filename ) + ' to ' + os.path.relpath( destination )
+    shutil.copy( filename , destination )
+
+################################################################################
+# SEQUENCE HANDLING HELPERS
+
+# basic converters...its done a lot
+
+# loading wrapper...basically cause "from Bio import SeqIO" is too long
+def load_sequence( filename , ignore_empty = True , seqformat_map = SEQFORMAT_MAP ):
+    """
+    Returns the list of sequences in  <filename>  as Biopython SeqRecord
+    objects
+    automatically handles different file format as specified by  <seqformat_map>
+    
+    Optionally  <ignore_empty>  sequences (SeqID in file but no sequence)
+    
+    To get string, use get_sequence
+    """
+    # determine the file format
+    seq_format = get_file_extension( filename )
+
+    # load ALL the sequences!
+    sequences = [i for i in SeqIO.parse( filename , seqformat_map[seq_format] )]
+    if ignore_empty:
+        sequences = [i for i in sequences if str( i.seq )]
+
+    # or just one...
+    if len( sequences ) == 1:
+        sequences = sequences[0]
+    
+    return sequences
+
+# general converter!
+def get_sequence( sequence , seq_format = SEQFORMAT , uppercase = True , ignore_empty = True , get_ids = False ):
+    """
+    Returns a string or list of string depending on the input  <sequence>
+    can accept:
+        a filename for a  <seq_format> file
+        a Biopython Seq object
+        a Biopython SeqRecord object
+        a string
+        a list of any of the above (can be heterogenous)
+        
+    Optionally change the sequence to  <uppercase>  (ambiguous positions are
+    sometimes lowercase)
+    Optionally <ignore_empty> sequences (SeqID in file but no sequence)
+    Optionally  <get_ids>  , returning a parallel list of SeqIDs and descriptions
+    """
+    # sort the input data type
+    # for common Biopython objects
+    if type( sequence ) == Seq:
+        sequence = str( sequence )
+    elif type( sequence ) == SeqRecord:
+        seq_ids = str( sequence.id )
+        seq_des = str( sequence.description )
+        sequence = str( sequence.seq )
+
+    # input file
+    elif '.' in sequence:    # should never occur!
+        # its a filename (?) so try to load it, it will error properly
+        sequence = load_sequence( sequence , ignore_empty )
+        # sort by number
+        if type( sequence ) == list:    # in accordance with the above
+            # optionally get the ids
+            if get_ids:
+                seq_ids = [str( i.id ) for i in sequence]
+                seq_des = [str( i.description )*( not i.description == i.id ) for i in sequence]
+            sequence = [str( i.seq ) for i in sequence]
+        else:
+            if get_ids:
+                seq_ids = str( sequence.id )
+                seq_des = str( sequence.description )*( not sequence.description == sequence.id )
+            sequence = str( sequence.seq )
+
+    # list of any of the above
+    elif type( sequence ) == list:
+        # then sort based on individual types...
+        sequence = [get_sequence( i , seq_format , uppercase , ignore_empty , get_ids ) for i in sequence]
+        if get_ids:
+            seq_ids = [i[1] for i in sequence]
+            seq_des = [i[2] for i in sequence]
+            sequence = [i[0] for i in sequence]
+    
+    # should be an input single string
+    else:
+        seq_ids = ''
+        seq_des = ''
+    
+    # optionally force UPPER case
+    if uppercase:
+        if type( sequence ) == str:
+            # single sequence
+            sequence = sequence.upper()
+        else:
+            # multiple
+            sequence = [i.upper() for i in sequence]
+    
+    # optionally return the id and descriptions too
+    if get_ids:
+        return sequence , seq_ids , seq_des
+    return sequence
+
+# general writer
+# return the filename
+def write_sequence( sequence , out_filename = '' , seq_format = SEQFORMAT , seqid = 'unknown' , description = '' , alphabet = DNAAlphabet , seq_format_map = SEQFORMAT_EXTENSION_MAP ):
+    """
+    Write  <sequence>  to  <out_filename>  as  <seq_format>  using  <alphabet>
+    
+    Robust to sequence inputs that are:
+        str (filename or sequence)
+        Seq
+        SeqRecord
+    """
+    # sort the input data type
+    unknown = 1
+    # for common Biopython objects
+    if isinstance( sequence , str ):
+        if '.' in sequence:    # should never occur, okay, I made it occur
+            print 'it appears you input a path or filename...so its already a file!'
+            return sequence
+        sequence = SeqRecord( Seq( sequence , alphabet ) )    # already default ID of unknown
+        sequence.id = seqid
+        sequence.description = description
+    elif isinstance( sequence , unicode ):    # hacky, unicode vs str
+        sequence = str( sequence )
+        if '.' in sequence:    # should never occur
+            print 'it appears you input a path or filename...so its already a file!'
+            return sequence
+        sequence = SeqRecord( Seq( sequence , alphabet ) )    # already default ID of unknown
+        sequence.id = seqid    
+        sequence.description = description
+    elif isinstance( sequence , Seq ):
+        sequence = SeqRecord( sequence )
+        sequence.id = seqid
+        sequence.description = description
+    elif isinstance( sequence , list ):
+        # yay, do it all over again :(
+        # make recursive
+
+        # assume all members are the same type...else its an error anyway
+        if isinstance( sequence[0] , str ):
+            for i in xrange( len( sequence ) ):
+                sequence[i] = SeqRecord( Seq( sequence[i] , alphabet ) )
+                sequence[i].id = seqid + '_' + str( unknown )
+                sequence[i].description = description
+                unknown += 1
+        elif isinstance( sequence[0] , Seq ):
+            for i in xrange( len( sequence ) ):
+                sequence[i] = SeqRecord( i )
+                sequence[i].id = seqid + '_' + str( unknown )
+                sequence[i].description = description
+                unknown += 1
+
+    # now that all are Biopython SeqRecords, write to file!
+    if not out_filename:
+        if type( sequence ) == list:
+            out_filename = sequence[0].id + '.' + seq_format_map[seq_format]
+        else:
+            out_filename = sequence.id + '.' + seq_format_map[seq_format]
+    
+    SeqIO.write( sequence , out_filename , seq_format )
+    print 'Successfully wrote the sequence(s) to ' + os.path.relpath( out_filename )
+    
+    return out_filename
 
 ################################################################################
 # FULL RAW PROCESSING
@@ -1476,13 +2663,25 @@ if __name__ == '__main__':
     # parser object for managing input options
     parser = optparse.OptionParser()
     # essential data
-    parser.add_option( '-i' , dest = 'pdb_filename' ,
+    parser.add_option( '-p' , dest = 'pdb_filename' ,
         default = '' ,
         help = 'the pdb filename to process' )
+    parser.add_option( '-f' , dest = 'seqformat' ,
+        default = SEQFORMAT ,
+        help = 'sequence file format, based on settings (!) and Biopython' )
+        
+    # the other options for the method...are for interactive use
+    # hard to manipulate from the commandline...
 
     (options,args) = parser.parse_args()
+    
+    # check inputs
+    # no edits/modifications
+    # kinda silly, but I do this as "my style", easy to modify cleanly
+    pdb_filename = options.pdb_filename
+    seqformat = options.seqformat
 
-    process_pdb( options.pdb_filename )
+    process_pdb( pdb_filename , seqformat )
 
 
 ################################################################################
