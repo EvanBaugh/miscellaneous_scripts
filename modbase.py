@@ -2,19 +2,25 @@
 # :noTabs=true:
 
 """
-remotely download from modbase
+remotely download from ModBase
+
+internal method "download_models_from_modbase" is the real winner
+other methods are for reloading afterwards (if necessary)
 
 so...some quirks, there seem to be multiple "user levels" including a
 distinction between "public" and "academic"...this seems odd to me so for now
-just looking at the public interface...or academic...as it seems to be?
+just looking at the default (public?) interface...
+or academic is default?
 
 reference the modeller.py script for scoring info...sorta...
+or nope
 
 there may be other data that is extractable from ModBase...however this is a bit
 obfuscated, for now, just focus on downloading the models and alignments
 
-rework: download, then extract!
-add in quality features...
+todo:
+    rework: download, then extract!
+    add in quality features...
 
 Author: Evan H. Baugh
 """
@@ -26,11 +32,53 @@ Author: Evan H. Baugh
 import os
 import urllib2
 from xml.dom.minidom import parse as xml_parse
+import shutil
+import optparse
 
 # bigger modules
 
 # custom modules
-from helper import create_directory , copy_file
+#from helper import create_directory , copy_file
+# place these simple helper scripts here instead, stand alone!
+
+################################################################################
+# HELPER METHODS
+
+# not very interesting, just ignore these
+# here because I like defining my own ways for these utilities which are in
+# another module...but you only care about ModBase stuff right? so
+# just put a copy here, that simple...
+
+# helper for creating a directory, checks and delets existing name
+def create_directory( dir_name , tagline = ' to sort the data' ):
+    """
+    Creates the directory  <dir_name>
+    
+    WARNING: this will delete the directory and its contents if it already
+    exists!
+    
+    Optionally output something special in  <tagline>
+    """
+    # check if it exists
+    print 'Creating a new directory ' + os.path.relpath( dir_name ) + tagline
+    if os.path.isdir( dir_name ):
+        print 'a directory named ' + os.path.relpath( dir_name ) + ' already exists, deleting it now...'
+        shutil.rmtree( dir_name )
+    os.mkdir( dir_name )
+
+# copy helper
+def copy_file( filename , destination , display = False ):
+    """
+    Copy  <filename>  to/into  <destination>
+    
+    just a cp wrapper...what?
+    """
+    if display:    # optional
+        if os.path.isdir( destination ):
+            print 'placing a copy of ' + os.path.relpath( filename ) + ' into the ' + os.path.relpath( destination ) + ' directory'
+        elif os.path.isfile( destination ):
+            print 'copying ' + os.path.relpath( filename ) + ' to ' + os.path.relpath( destination )
+    shutil.copy( filename , destination )
 
 ################################################################################
 # METHODS
@@ -490,6 +538,55 @@ def extract_modbase_model_details_from_modbase_directory( query , out_directory 
 # MAIN
 
 if __name__ == '__main__':
-    None
+    # parser object for managing input options
+    parser = optparse.OptionParser()
+    # essential data
+    parser.add_option( '-q' , dest = 'query' ,
+        default = '' ,
+        help = 'the (UniProt) ID to download from ModBase' )
+
+    parser.add_option( '-o' , dest = 'out_directory' ,
+        default = 'modbase_models' ,
+        help = 'the name of the directory to create, for storing the downloads' )
+    parser.add_option( '-r' , dest = 'root_filename' ,
+        default = '' ,
+        help = 'the \"root\" for naming the files, defaults to the query' )
+
+    parser.add_option( '-d' , dest = 'dataset' ,
+        default = '' ,
+        help = 'which ModBase dataset to download from' )
+    # boolean options, sry if this is confusing, default them all to True
+    # so when you use them, you turn them off
+    parser.add_option( '-a' , dest = 'get_alignment' ,
+        default = True ,
+        help = 'include the alignments per model/template? default=True' ,
+        action = 'store_false' )
+    parser.add_option( '-w' , dest = 'write_summary' ,
+        default = True ,
+        help = 'output the stdout summary of the models? default=True' ,
+        action = 'store_false' )
+    parser.add_option( '-v' , dest = 'display' ,
+        default = True ,
+        help = 'print out \"useful\" information while running? default=True' ,
+        action = 'store_false' )
+
+    (options,args) = parser.parse_args()
+
+    # check inputs
+    # no edits/modifications
+    # kinda silly, but I do this as "my style", easy to modify cleanly
+    query = options.query
+    out_directory = options.out_directory
+    root_filename = options.root_filename
+    dataset = options.dataset
+    get_alignment = options.get_alignment
+    write_summary = options.write_summary
+    display = options.display
+
+    # choose the default method to run
+    download_models_from_modbase( query , out_directory = out_directory ,
+        root_filename = root_filename , dataset = dataset ,
+        get_alignment = get_alignment , write_summary = write_summary ,
+        display = display )
 
 

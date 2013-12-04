@@ -2,6 +2,14 @@
 # :noTabs=true:
 
 """
+remotely download from SwissModel
+
+internal method "download_models_from_swissmodel" is the real winner
+other methods are for reloading afterwards (if necessary)
+
+...I know less about the options/details here etc., just a quick script for
+downloading remotely
+
 ugh...more messy comparative model data mining...because these people don't
 make the most intuitive interfaces :(
 
@@ -12,8 +20,9 @@ yay! however ugly, it works! and a LOT faster than ModBase
     -avoid pwd swapping etc.
     -extract more data! a lot of fun stuff on the initial swissmodel page
 
-rework: download, then extract!
-add in quality features...
+todo:
+    rework: download, then extract!
+    add in quality features...
 
 Author: Evan H. Baugh
 """
@@ -26,14 +35,72 @@ import os
 import re
 import tarfile
 import urllib2
+import shutil
+import optparse
 
 # bigger modules
 
 # custom modules
-from helper import create_directory , move_file , copy_file
+#from helper import create_directory , move_file , copy_file
 #from quality import evaluate_quality , calculate_expected_rmsd_from_sequence_identity
+# place these simple helper scripts here instead, stand alone!
 
-from secstruct import morph_secstruct
+#from secstruct import morph_secstruct
+# this is just for customizing secondary structure characters
+# in many cases, an extreme luxury feature...so lets abandon it for this
+
+################################################################################
+# HELPER METHODS
+
+# not very interesting, just ignore these
+# here because I like defining my own ways for these utilities which are in
+# another module...but you only care about ModBase stuff right? so
+# just put a copy here, that simple...
+
+# helper for creating a directory, checks and delets existing name
+def create_directory( dir_name , tagline = ' to sort the data' ):
+    """
+    Creates the directory  <dir_name>
+    
+    WARNING: this will delete the directory and its contents if it already
+    exists!
+    
+    Optionally output something special in  <tagline>
+    """
+    # check if it exists
+    print 'Creating a new directory ' + os.path.relpath( dir_name ) + tagline
+    if os.path.isdir( dir_name ):
+        print 'a directory named ' + os.path.relpath( dir_name ) + ' already exists, deleting it now...'
+        shutil.rmtree( dir_name )
+    os.mkdir( dir_name )
+
+# copy helper
+def copy_file( filename , destination , display = False ):
+    """
+    Copy  <filename>  to/into  <destination>
+    
+    just a cp wrapper...what?
+    """
+    if display:    # optional
+        if os.path.isdir( destination ):
+            print 'placing a copy of ' + os.path.relpath( filename ) + ' into the ' + os.path.relpath( destination ) + ' directory'
+        elif os.path.isfile( destination ):
+            print 'copying ' + os.path.relpath( filename ) + ' to ' + os.path.relpath( destination )
+    shutil.copy( filename , destination )
+
+# move helper
+def move_file( filename , destination , display = False ):
+    """
+    Move  <filename>  to/into  <destination>
+    
+    just a mv wrapper...what?
+    """
+    if display:    # optional
+        if os.path.isdir( destination ):
+            print 'moving ' + os.path.relpath( filename ) + ' into the ' + os.path.relpath( destination ) + ' directory'
+        elif os.path.isfile( destination ):
+            print 'renaming ' + os.path.relpath( filename ) + ' to ' + os.path.relpath( destination )
+    shutil.move( filename , destination )
 
 ################################################################################
 # METHODS
@@ -46,7 +113,7 @@ def download_models_from_swissmodel( query , out_directory = 'swissmodel_models'
     Returns "details" on the models for  <query>  in SwissModel
     write results to  <out_directory>  with the base  <root_filename>
 
-    ...    
+    ...
     """
     # url
     url = 'http://swissmodel.expasy.org/repository/smr.php'
@@ -289,7 +356,8 @@ def extract_modeling_details_from_swissmodel_hhm( swissmodel_hhm_filename ):
     
     # convert the str?
     # oh well...
-    secstruct_str = morph_secstruct( secstruct_str )
+#    secstruct_str = morph_secstruct( secstruct_str )
+    # not supported in this version of the script
     
     return secstruct_str
 
@@ -307,6 +375,31 @@ def extract_additional_details_from_swissmodel_html_page( swissmodel_html_str ):
 # MAIN
 
 if __name__ == '__main__':
-    None
+    # parser object for managing input options
+    parser = optparse.OptionParser()
+    # essential data
+    parser.add_option( '-q' , dest = 'query' ,
+        default = '' ,
+        help = 'the (UniProt) ID to download from SwissModel' )
+
+    parser.add_option( '-o' , dest = 'out_directory' ,
+        default = 'swissmodel_models' ,
+        help = 'the name of the directory to create, for storing the downloads' )
+    parser.add_option( '-r' , dest = 'root_filename' ,
+        default = '' ,
+        help = 'the \"root\" for naming the files, defaults to the query' )
+
+    (options,args) = parser.parse_args()
+
+    # check inputs
+    # no edits/modifications
+    # kinda silly, but I do this as "my style", easy to modify cleanly
+    query = options.query
+    out_directory = options.out_directory
+    root_filename = options.root_filename
+
+    # choose the default method to run
+    download_models_from_swissmodel( query , out_directory = out_directory ,
+        root_filename = root_filename )
 
 
